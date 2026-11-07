@@ -59,7 +59,8 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Laser<span>Remote</span> <small style="font-size:12px;color:var(--muted)">v2</small></h1>
+    <h1>Laser<span>Remote</span> <small style="font-size:12px;color:var(--muted)">v3</small>
+      <span id="offline" style="display:block;font-size:12px;font-weight:500;color:var(--muted);margin-top:2px">Checking offline…</span></h1>
     <div class="status"><div id="dot" class="dot"></div><span id="statusTxt">Not connected</span></div>
   </header>
 
@@ -312,6 +313,29 @@
 
   if (!navigator.bluetooth) $('noBle').style.display='block';
   render();
+
+  // ---- offline mode ----
+  (async () => {
+    const el = $('offline');
+    const set = (txt, col) => { el.textContent = txt; el.style.color = col || 'var(--muted)'; };
+    if (!('serviceWorker' in navigator)) {
+      set('Offline not supported here — keep this tab open', 'var(--accent)'); return;
+    }
+    try {
+      await navigator.serviceWorker.register('./sw.js');
+      await navigator.serviceWorker.ready;
+      const ok = await caches.match('./index.html') || await caches.match('./');
+      if (ok) set('Offline ready ✓', 'var(--ok)');
+      else { set('Saving for offline…'); setTimeout(async () => {
+        set((await caches.match('./index.html')) ? 'Offline ready ✓' : 'Offline not saved yet — reload once with signal',
+            (await caches.match('./index.html')) ? 'var(--ok)' : 'var(--accent)');
+      }, 2500); }
+    } catch (e) {
+      log('er', 'Offline setup: ' + e.message);
+      set('Offline not supported here — keep this tab open', 'var(--accent)');
+    }
+    window.addEventListener('offline', () => log('', 'No signal — running from saved copy'));
+  })();
 })();
 </script>
 </body>
