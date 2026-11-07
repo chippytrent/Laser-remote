@@ -59,7 +59,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Laser<span>Remote</span></h1>
+    <h1>Laser<span>Remote</span> <small style="font-size:12px;color:var(--muted)">v2</small></h1>
     <div class="status"><div id="dot" class="dot"></div><span id="statusTxt">Not connected</span></div>
   </header>
 
@@ -78,10 +78,6 @@
   <button id="btnMeasure" class="measure" disabled>MEASURE</button>
   <input id="label" class="label" placeholder="Label for next reading (optional), e.g. W1 height" autocomplete="off">
 
-  <div class="row" style="margin-top:10px">
-    <button id="btnLaserOn" disabled>Laser on</button>
-    <button id="btnLaserOff" disabled>Laser off</button>
-  </div>
 
   <h2><span>Readings</span><span id="count">0</span></h2>
   <ul id="list"></ul>
@@ -98,6 +94,11 @@
       <button id="btnSend" style="flex:1">Send</button>
     </div>
     <div class="small">Type bytes without the checksum — it's added automatically.</div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnAlt" class="dbgcmd">Try trigger B</button>
+      <button id="btnOld" class="dbgcmd">Try old trigger</button>
+    </div>
+    <label class="small" style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="showHb"> Show "still here" messages (C0 11)</label>
     <div class="row" style="margin-top:8px">
       <button id="btnCopyLog">Copy log</button>
       <button id="btnClearLog">Clear log</button>
@@ -125,15 +126,16 @@
   const frame = arr => Uint8Array.from([...arr, crc8(arr)]);
   const CMD = {
     sync:     frame([0xC0,0x55,0x02,0x01,0x00]), // turn on auto-send of measurements
-    measure:  frame([0xC0,0x40,0x00]),           // trigger a measurement
-    laserOn:  frame([0xC0,0x41,0x00]),
-    laserOff: frame([0xC0,0x42,0x00]),
+    measure:  frame([0xC0,0x56,0x01,0x00]),      // remote trigger (BLE "C" models)
+    measureAlt: frame([0xC0,0x56,0x01,0x01]),    // variant to try if the above doesn't fire
+    measureOld: frame([0xC0,0x40,0x00]),         // old classic-Bluetooth models (GLM 100 C)
   };
+  const STATUS = {1:'communication timeout',3:'checksum error',4:'command not supported',5:'invalid argument',6:'device busy'};
 
   // ---- UI refs ----
   const $ = id => document.getElementById(id);
   const ui = {dot:$('dot'), st:$('statusTxt'), val:$('val'), sub:$('sub'), list:$('list'), count:$('count'), log:$('log'), label:$('label')};
-  const ctrl = ['btnMeasure','btnLaserOn','btnLaserOff','btnDisconnect'].map($);
+  const ctrl = ['btnMeasure','btnDisconnect','btnAlt','btnOld'].map($);
 
   let device=null, chr=null, readings=[], lastSig='', lastAt=0;
 
@@ -165,21 +167,38 @@
 
   // ---- parsing ----
   function parse(b){
-    // Remote-measure reply: 00 04 [uint32 LE, units of 0.05 mm] crc
-    if (b.length >= 7 && b[0]===0x00 && b[1]===0x04){
-      const v = new DataView(b.buffer, b.byteOffset).getUint32(2, true);
-      return v * 0.05;
-    }
+    const dv = new DataView(b.buffer, b.byteOffset);
     // Auto-sync notification: C0 55 10 ... float32 LE metres at offset 7
     if (b.length >= 11 && b[0]===0xC0 && b[1]===0x55 && b[2]===0x10){
-      const m = new DataView(b.buffer, b.byteOffset).getFloat32(7, true);
-      if (isFinite(m) && m > 0 && m < 300) return m * 1000;
+      const m = dv.getFloat32(7, true);
+      log('', `  decoded ${isFinite(m) ? (m*1000).toFixed(1)+' mm' : 'no value'}`);
+      if (isFinite(m) && m > 0 && m < 250) return m * 1000;
+      return null;
+    }
+    // Reply to a command: [status] [len] ... crc
+    if (b.length >= 3 && b[0] !== 0xC0){
+      const status = b[0];
+      if (status !== 0){
+        const why = STATUS[status] || ('error code ' + status);
+        log('er', '  laser replied: ' + why);
+        ui.sub.textContent = 'Laser: ' + why;
+        return null;
+      }
+      // Old-model measure reply: 00 04 [int32 LE, 0.05 mm units]
+      if (b[1]===0x04 && b.length >= 7){
+        const v = dv.getInt32(2, true);
+        if (v > 0 && v * 0.05 < 250000) return v * 0.05;
+        log('er', '  no valid distance in reply');
+        ui.sub.textContent = 'Laser returned no reading';
+      }
     }
     return null;
   }
 
   function onData(ev){
     const b = new Uint8Array(ev.target.value.buffer.slice(0));
+    const heartbeat = b.length===4 && b[0]===0xC0 && b[1]===0x11;
+    if (heartbeat && !$('showHb').checked) return;
     log('rx', 'RX ' + hex(b));
     const mm = parse(b);
     if (mm == null || mm <= 0) return;
@@ -278,8 +297,8 @@
   $('btnConnect').onclick = connect;
   $('btnDisconnect').onclick = disconnect;
   $('btnMeasure').onclick = () => write(CMD.measure);
-  $('btnLaserOn').onclick = () => write(CMD.laserOn);
-  $('btnLaserOff').onclick = () => write(CMD.laserOff);
+  $('btnAlt').onclick = () => write(CMD.measureAlt);
+  $('btnOld').onclick = () => write(CMD.measureOld);
   $('btnCopyAll').onclick = () => readings.length ? copy(readings.slice().reverse().map((r,i)=>`${i+1}\t${r.label||''}\t${r.mm}`).join('\n')) : toast('Nothing to copy');
   $('btnCsv').onclick = exportCsv;
   $('btnClear').onclick = () => { if (readings.length && confirm('Clear all readings?')) { readings=[]; save(); render(); ui.val.textContent='—'; } };
