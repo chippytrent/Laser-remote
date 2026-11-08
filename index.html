@@ -59,7 +59,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Laser<span>Remote</span> <small style="font-size:12px;color:var(--muted)">v3</small>
+    <h1>Laser<span>Remote</span> <small style="font-size:12px;color:var(--muted)">v4</small>
       <span id="offline" style="display:block;font-size:12px;font-weight:500;color:var(--muted);margin-top:2px">Checking offline…</span></h1>
     <div class="status"><div id="dot" class="dot"></div><span id="statusTxt">Not connected</span></div>
   </header>
@@ -167,13 +167,31 @@
   }
 
   // ---- parsing ----
+  // Result messages: C0 55 10 [mode] [?] [counter 2B] [f1] [f2] [f3] crc
+  //   mode 06 = distance        f1 = distance (m)
+  //   mode 2A = indirect height f1 = height (m), f2 = distance (m), f3 = angle (deg)
+  //   mode 02 = laser switched on (aiming) — no value
+  //   anything else is logged and ignored
+  let lastCounter = -1;
+  const okM = m => isFinite(m) && m > 0 && m < 250;
   function parse(b){
     const dv = new DataView(b.buffer, b.byteOffset);
-    // Auto-sync notification: C0 55 10 ... float32 LE metres at offset 7
-    if (b.length >= 11 && b[0]===0xC0 && b[1]===0x55 && b[2]===0x10){
-      const m = dv.getFloat32(7, true);
-      log('', `  decoded ${isFinite(m) ? (m*1000).toFixed(1)+' mm' : 'no value'}`);
-      if (isFinite(m) && m > 0 && m < 250) return m * 1000;
+    if (b.length >= 19 && b[0]===0xC0 && b[1]===0x55 && b[2]===0x10){
+      const mode = b[3], counter = dv.getUint16(5, true);
+      const f1 = dv.getFloat32(7, true), f2 = dv.getFloat32(11, true), f3 = dv.getFloat32(15, true);
+      if (mode === 0x02){ log('', '  laser on — aiming'); ui.sub.textContent = 'Laser on — tap MEASURE again'; return null; }
+      if (counter === lastCounter) return null; // same shot reported twice
+      if (mode === 0x06 && okM(f1)){
+        lastCounter = counter;
+        log('', `  distance ${(f1*1000).toFixed(1)} mm`);
+        return {mm: f1*1000};
+      }
+      if (mode === 0x2A && okM(f2) && isFinite(f3)){
+        lastCounter = counter;
+        log('', `  indirect: dist ${(f2*1000).toFixed(1)} mm, angle ${f3.toFixed(2)}°, height ${(f1*1000).toFixed(1)} mm`);
+        return {mm: f2*1000, angle: f3, height: isFinite(f1) ? f1*1000 : null};
+      }
+      log('', `  mode ${b[3].toString(16).toUpperCase().padStart(2,'0')} ignored (values ${[f1,f2,f3].map(v=>+v.toFixed(4)).join(', ')})`);
       return null;
     }
     // Reply to a command: [status] [len] ... crc
@@ -188,7 +206,7 @@
       // Old-model measure reply: 00 04 [int32 LE, 0.05 mm units]
       if (b[1]===0x04 && b.length >= 7){
         const v = dv.getInt32(2, true);
-        if (v > 0 && v * 0.05 < 250000) return v * 0.05;
+        if (v > 0 && v * 0.05 < 250000) return {mm: v * 0.05};
         log('er', '  no valid distance in reply');
         ui.sub.textContent = 'Laser returned no reading';
       }
@@ -201,23 +219,50 @@
     const heartbeat = b.length===4 && b[0]===0xC0 && b[1]===0x11;
     if (heartbeat && !$('showHb').checked) return;
     log('rx', 'RX ' + hex(b));
-    const mm = parse(b);
-    if (mm == null || mm <= 0) return;
-    const r = Math.round(mm);
+    const res = parse(b);
+    if (!res) return;
+    const r = Math.round(res.mm);
     // ignore duplicate (same value within 600 ms — remote + sync can both report)
     const now = Date.now();
     if (String(r)===lastSig && now-lastAt < 600) return;
     lastSig = String(r); lastAt = now;
-    addReading(r);
+    addReading(res);
   }
 
-  function addReading(mm){
+  // Work out how the laser was sitting from the angle
+  function orient(angle){
+    const a = Math.abs(angle);
+    if (a < 2)  return {o:'Horizontal', off: a};
+    if (a > 88) return {o:'Vertical', off: 90 - a};
+    return {o:'Angled', off: 0};
+  }
+  function describe(r){
+    if (r.angle == null) return '';
+    let s = `${r.orient} · ${r.angle.toFixed(1)}°`;
+    if (r.orient !== 'Angled' && r.off >= 0.5) s += ` · ${r.off.toFixed(1)}° off ${r.orient==='Vertical'?'plumb':'level'}`;
+    if (r.orient === 'Angled') s += ` · H ${Math.round(r.height ?? r.mm*Math.sin(r.angle*Math.PI/180)).toLocaleString('en-AU')} · Horiz ${Math.round(r.horiz).toLocaleString('en-AU')}`;
+    return s;
+  }
+
+  function addReading(res){
     const lbl = ui.label.value.trim();
-    readings.unshift({mm, label:lbl, t:new Date().toISOString()});
+    const mm = Math.round(res.mm);
+    const rec = {mm, label:lbl, t:new Date().toISOString()};
+    if (res.angle != null){
+      const {o, off} = orient(res.angle);
+      Object.assign(rec, {
+        angle: +res.angle.toFixed(2), orient: o, off: +off.toFixed(2),
+        height: res.height != null ? Math.round(res.height) : null,
+        horiz: Math.round(res.mm * Math.cos(res.angle * Math.PI/180)),
+      });
+    }
+    readings.unshift(rec);
     ui.label.value = '';
     save(); render();
     ui.val.textContent = mm.toLocaleString('en-AU');
-    ui.sub.textContent = (lbl ? lbl + ' · ' : '') + (mm/1000).toFixed(3) + ' m';
+    const d = describe(rec);
+    ui.sub.textContent = [lbl, d || (mm/1000).toFixed(3) + ' m'].filter(Boolean).join(' · ');
+    ui.sub.style.color = (rec.orient && rec.orient!=='Angled' && rec.off >= 0.5) ? 'var(--accent)' : '';
     if (navigator.vibrate) navigator.vibrate(30);
   }
 
@@ -228,7 +273,11 @@
     readings.forEach((r,i)=>{
       const li = document.createElement('li');
       li.innerHTML = `<span class="n">${readings.length-i}</span><span class="mm">${r.mm.toLocaleString('en-AU')}</span><span class="lbl"></span>`;
-      li.querySelector('.lbl').textContent = r.label || '';
+      const lb = li.querySelector('.lbl');
+      lb.textContent = r.label || '';
+      const d = describe(r);
+      if (d){ const s=document.createElement('div'); s.textContent=d; s.style.fontSize='12px';
+        if (r.orient!=='Angled' && r.off>=0.5) s.style.color='var(--accent)'; lb.appendChild(s); lb.style.whiteSpace='normal'; }
       const bc = document.createElement('button'); bc.textContent='Copy'; bc.onclick=()=>copy(String(r.mm));
       const be = document.createElement('button'); be.textContent='✎'; be.onclick=()=>{ const v=prompt('Label', r.label||''); if(v!==null){ r.label=v.trim(); save(); render(); } };
       const bd = document.createElement('button'); bd.textContent='✕'; bd.onclick=()=>{ readings.splice(i,1); save(); render(); };
@@ -279,8 +328,9 @@
 
   // ---- export ----
   function csv(){
-    const rows = [['#','Label','mm','Time']];
-    readings.slice().reverse().forEach((r,i)=>rows.push([i+1, r.label||'', r.mm, new Date(r.t).toLocaleString('en-AU')]));
+    const rows = [['#','Label','Distance mm','Angle deg','Orientation','Height mm','Horizontal mm','Time']];
+    readings.slice().reverse().forEach((r,i)=>rows.push([i+1, r.label||'', r.mm,
+      r.angle ?? '', r.orient ?? '', r.height ?? '', r.horiz ?? '', new Date(r.t).toLocaleString('en-AU')]));
     return rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
   }
   async function exportCsv(){
