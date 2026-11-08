@@ -1,5 +1,5 @@
 // LaserRemote offline cache
-const CACHE = 'laserremote-v3';
+const CACHE = 'laserremote-v4';
 const FILES = ['./', './index.html'];
 
 self.addEventListener('install', e => {
